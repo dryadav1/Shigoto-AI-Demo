@@ -1,19 +1,23 @@
-import db from "./db.js";
+import { prepare } from "./db.js";
 import { verifyToken } from "./tokens.js";
 
 /** Attach req.user from Bearer access token. 401 when missing/invalid. */
-export function requireAuth(req, res, next) {
-  const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "unauthorized" });
+export async function requireAuth(req, res, next) {
   try {
-    const payload = verifyToken(token);
-    const row = db.prepare("SELECT * FROM users WHERE id = ?").get(payload.sub);
-    if (!row) return res.status(401).json({ error: "unauthorized" });
-    req.user = { id: row.id, name: row.name, email: row.email, role: row.role };
-    next();
-  } catch {
-    return res.status(401).json({ error: "unauthorized" });
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "unauthorized" });
+    try {
+      const payload = verifyToken(token);
+      const row = await prepare("SELECT * FROM users WHERE id = ?").get(payload.sub);
+      if (!row) return res.status(401).json({ error: "unauthorized" });
+      req.user = { id: row.id, name: row.name, email: row.email, role: row.role };
+      next();
+    } catch {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+  } catch (err) {
+    next(err);
   }
 }
 

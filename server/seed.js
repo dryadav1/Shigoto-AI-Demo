@@ -1,14 +1,14 @@
 /**
  * Demo seed: users + 128 enquiries + notifications.
- * Runs once on first server start (when users table is empty).
- * Deterministic data so the demo is identical on every fresh install.
+ * Runs once on first start (when users table is empty).
+ * Bulk inserts keep serverless cold starts fast.
  *
  * Production: set SEED_DEMO=false to skip demo data. Optionally set
  * ADMIN_EMAIL + ADMIN_PASSWORD (+ ADMIN_NAME) to bootstrap the first
  * owner account on an empty database.
  */
 import bcrypt from "bcryptjs";
-import db, { nextSequence, logEvent } from "./db.js";
+import { initSchema, prepare } from "./db.js";
 
 function mulberry32(seed) {
   return () => {
@@ -69,28 +69,48 @@ const NOTE_TEXT = [
 const TEAM = ["tanaka", "sato", "suzuki", "yamada"];
 const DOMAINS = ["mirai-tech.jp", "abc-mfg.co.jp", "osaka-trading.co.jp", "nagoya-parts.jp", "example.co.jp"];
 
-export function seedIfEmpty() {
-  const userCount = db.prepare("SELECT COUNT(*) AS c FROM users").get().c;
-  if (userCount > 0) return;
+/** Multi-row INSERT in chunks (single round-trip per chunk). */
+async function bulkInsert(table, cols, matrix, chunkSize = 64) {
+  for (let i = 0; i < matrix.length; i += chunkSize) {
+    const chunk = matrix.slice(i, i + chunkSize);
+    const groups = chunk.map((r) => `(${r.map(() => "?").join(",")})`).join(",");
+    await prepare(`INSERT INTO ${table}(${cols.join(",")}) VALUES ${groups}`).run(...chunk.flat());
+  }
+}
+
+export async function seedIfEmpty() {
+  await initSchema();
+  const countRow = await prepare("SELECT COUNT(*) AS c FROM users").get();
+  if (Number(countRow.c) > 0) return;
 
   if (process.env.SEED_DEMO === "false") {
-    bootstrapAdmin();
+    await bootstrapAdmin();
     return;
   }
 
+  try {
+    await seedDemo();
+  } catch (err) {
+    // Cold-start race: another instance seeded first (unique constraint).
+    if (err?.code === "SQLITE_CONSTRAINT_UNIQUE" || err?.code === "23505") {
+      console.log("[seed] already seeded by another instance.");
+      return;
+    }
+    throw err;
+  }
+}
+
+async function seedDemo() {
   const now = new Date().toISOString();
   const hash = bcrypt.hashSync("demo-pass", 10);
-  const users = [
-    ["田中 オーナー", "owner@mirai-tech.jp", "owner"],
-    ["田中 管理者", "admin@mirai-tech.jp", "admin"],
-    ["佐藤 マネージャー", "manager@mirai-tech.jp", "manager"],
-    ["鈴木 社員", "employee@mirai-tech.jp", "employee"],
-    ["山田 閲覧者", "viewer@mirai-tech.jp", "viewer"],
-  ];
-  const insUser = db.prepare("INSERT INTO users(name, email, password_hash, role, created_at) VALUES(?,?,?,?,?)");
-  for (const [name, email, role] of users) insUser.run(name, email, hash, role, now);
+  await bulkInsert("users", ["name", "email", "password_hash", "role", "created_at"], [
+    ["田中 オーナー", "owner@mirai-tech.jp", hash, "owner", now],
+    ["田中 管理者", "admin@mirai-tech.jp", hash, "admin", now],
+    ["佐藤 マネージャー", "manager@mirai-tech.jp", hash, "manager", now],
+    ["鈴木 社員", "employee@mirai-tech.jp", hash, "employee", now],
+    ["山田 閲覧者", "viewer@mirai-tech.jp", hash, "viewer", now],
+  ]);
 
-  // ---- enquiries (deterministic) ----
   const rnd = mulberry32(20260917);
   const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
   const bag = [
@@ -111,16 +131,16 @@ export function seedIfEmpty() {
 
   const day = 86400000;
   const nowMs = Date.now();
-  const insEnq = db.prepare(`INSERT INTO enquiries(
-    id, company_ja, company_en, contact_ja, contact_en, email, phone, industry_id,
-    employee_count, current_software, problem_ja, problem_en, automation_ja, automation_en,
-    message, status, assigned_to, demo_date, pilot_id, archived, created_at, updated_at
-  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-  const insNote = db.prepare("INSERT INTO enquiry_notes(enquiry_id, author_id, text, created_at) VALUES(?,?,?,?)");
+  const enqCols = ["id", "company_ja", "company_en", "contact_ja", "contact_en", "email", "phone",
+    "industry_id", "employee_count", "current_software", "problem_ja", "problem_en",
+    "automation_ja", "automation_en", "message", "status", "assigned_to", "demo_date",
+    "pilot_id", "archived", "created_at", "updated_at"];
+  const enqRows = [];
+  const noteRows = [];
   let pilotSeq = 0;
 
   for (let i = 0; i < N; i++) {
-    const num = nextSequence("enquiry_seq");
+    const num = i + 1;
     const id = `JPN-2026-${String(num).padStart(5, "0")}`;
     const [companyJa, companyEn] = COMPANIES[i % COMPANIES.length];
     const [contactJa, contactEn] = CONTACTS[(i * 7 + 3) % CONTACTS.length];
@@ -139,7 +159,7 @@ export function seedIfEmpty() {
       pilotSeq += 1;
       pilotId = `PLT-2026-${String(pilotSeq).padStart(3, "0")}`;
     }
-    insEnq.run(
+    enqRows.push([
       id, companyJa, companyEn, contactJa, contactEn,
       `contact${num}@${pick(DOMAINS)}`,
       `03-${String(1000 + Math.floor(rnd() * 9000))}-${String(1000 + Math.floor(rnd() * 9000))}`,
@@ -149,35 +169,35 @@ export function seedIfEmpty() {
       `${companyEn} is interested in the Japan Pilot. ${problemEn} We would like to automate: ${automationEn}`,
       status, assigned,
       isDemoStage ? new Date(nowMs + (1 + Math.floor(rnd() * 10)) * day).toISOString() : null,
-      pilotId, 0, createdAt, updatedAt
-    );
+      pilotId, 0, createdAt, updatedAt,
+    ]);
     if (needsOwner && rnd() > 0.35) {
       const nCount = 1 + Math.floor(rnd() * 2);
       for (let k = 0; k < nCount; k++) {
         const t = pick(NOTE_TEXT);
-        insNote.run(id, pick(TEAM), rnd() > 0.5 ? t[0] : t[1],
-          new Date(new Date(createdAt).getTime() + (k + 1) * day).toISOString());
+        noteRows.push([id, pick(TEAM), rnd() > 0.5 ? t[0] : t[1],
+          new Date(new Date(createdAt).getTime() + (k + 1) * day).toISOString()]);
       }
     }
-    logEvent(id, "system", "seeded", null, status);
   }
-  db.prepare("INSERT INTO counters(name, value) VALUES('pilot_seq', ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value").run(pilotSeq);
+  await bulkInsert("enquiries", enqCols, enqRows);
+  if (noteRows.length) await bulkInsert("enquiry_notes", ["enquiry_id", "author_id", "text", "created_at"], noteRows);
+  await prepare("INSERT INTO counters(name, value) VALUES('enquiry_seq', ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value").run(N);
+  await prepare("INSERT INTO counters(name, value) VALUES('pilot_seq', ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value").run(pilotSeq);
 
-  // notifications for 3 newest
-  const newest = db.prepare("SELECT * FROM enquiries ORDER BY created_at DESC LIMIT 3").all();
-  const insNotif = db.prepare("INSERT INTO notifications(id, enquiry_id, title_ja, title_en, body_ja, body_en, read, created_at) VALUES(?,?,?,?,?,?,?,?)");
-  newest.forEach((e, i) => {
-    insNotif.run(`NOTIF-${e.id}`, e.id,
+  const newest = await prepare("SELECT * FROM enquiries ORDER BY created_at DESC LIMIT 3").all();
+  await bulkInsert("notifications",
+    ["id", "enquiry_id", "title_ja", "title_en", "body_ja", "body_en", "read", "created_at"],
+    newest.map((e, i) => [`NOTIF-${e.id}`, e.id,
       "新規 Japan Pilot 問い合わせ", "New Japan Pilot Enquiry",
       `${e.company_ja}（${e.contact_ja}）から問い合わせがありました。`,
       `Enquiry submitted by ${e.company_en} (${e.contact_en}).`,
-      i === 0 ? 0 : 1, e.created_at);
-  });
+      i === 0 ? 0 : 1, e.created_at]));
   console.log(`[seed] users=5 enquiries=${N} pilotSeq=${pilotSeq}`);
 }
 
 /** Production bootstrap: create the first owner from env vars (no demo data). */
-export function bootstrapAdmin() {
+export async function bootstrapAdmin() {
   const email = (process.env.ADMIN_EMAIL || "").toLowerCase().trim();
   const password = process.env.ADMIN_PASSWORD || "";
   if (!email || password.length < 8) {
@@ -185,7 +205,9 @@ export function bootstrapAdmin() {
     return;
   }
   const name = process.env.ADMIN_NAME || "Owner";
-  db.prepare("INSERT INTO users(name, email, password_hash, role, created_at) VALUES(?,?,?,?,?)")
+  await prepare("INSERT INTO users(name, email, password_hash, role, created_at) VALUES(?,?,?,?,?)")
     .run(name, email, bcrypt.hashSync(password, 10), "owner", new Date().toISOString());
   console.log(`[seed] bootstrap owner created: ${email}`);
 }
+
+export default { seedIfEmpty, bootstrapAdmin };

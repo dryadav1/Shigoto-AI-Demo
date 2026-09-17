@@ -1,9 +1,10 @@
 import { Router } from "express";
-import db from "../db.js";
+import { prepare } from "../db.js";
 import { requireAuth, requireEnquiryAccess } from "../middleware.js";
 
 const router = Router();
-router.use(requireAuth, requireEnquiryAccess);
+// Scoped per-route (owner/admin only) so other /api routes stay reachable.
+const admin = [requireAuth, requireEnquiryAccess];
 
 function toNotif(r) {
   return {
@@ -14,19 +15,25 @@ function toNotif(r) {
   };
 }
 
-router.get("/notifications", (req, res) => {
-  const rows = db.prepare("SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50").all();
-  res.json(rows.map(toNotif));
+router.get("/notifications", admin, async (req, res, next) => {
+  try {
+    const rows = await prepare("SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50").all();
+    res.json(rows.map(toNotif));
+  } catch (err) { next(err); }
 });
 
-router.patch("/notifications/:id/read", (req, res) => {
-  db.prepare("UPDATE notifications SET read = 1 WHERE id = ?").run(req.params.id);
-  res.json({ ok: true });
+router.patch("/notifications/:id/read", admin, async (req, res, next) => {
+  try {
+    await prepare("UPDATE notifications SET read = 1 WHERE id = ?").run(req.params.id);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
 });
 
-router.post("/notifications/read-all", (_req, res) => {
-  db.prepare("UPDATE notifications SET read = 1").run();
-  res.json({ ok: true });
+router.post("/notifications/read-all", admin, async (_req, res, next) => {
+  try {
+    await prepare("UPDATE notifications SET read = 1").run();
+    res.json({ ok: true });
+  } catch (err) { next(err); }
 });
 
 export default router;
